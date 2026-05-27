@@ -76,7 +76,7 @@ var _ = Describe("Nerd", func() {
 	})
 
 	JustBeforeEach(func() {
-		cnerd = nerd.New(containerdClient, containerdContext, fifoDir, mp)
+		cnerd = nerd.New(containerdClient, containerdContext, fifoDir, mp, "")
 	})
 
 	AfterEach(func() {

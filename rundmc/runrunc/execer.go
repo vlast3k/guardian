@@ -3,6 +3,7 @@ package runrunc
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -63,6 +64,13 @@ func (e *Execer) ExecWithBndl(log lager.Logger, sandboxHandle string, bundle goc
 	}
 
 	rootfsPath := filepath.Join("/proc", strconv.Itoa(ctrInitPid), "root")
+	// Patch4-bundle-root-fallback: for runsc, /proc/<sandbox>/root is the host fs;
+	// /etc/passwd is not visible. Fall back to the bundle's rootfs path.
+	if _, statErr := os.Stat(filepath.Join(rootfsPath, "etc", "passwd")); statErr != nil {
+		if bundle.Spec.Root != nil && bundle.Spec.Root.Path != "" {
+			rootfsPath = bundle.Spec.Root.Path
+		}
+	}
 	user, err := e.userLookupper.Lookup(rootfsPath, spec.User)
 	if err != nil {
 		log.Error("user-lookup-failed", err)

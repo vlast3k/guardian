@@ -38,6 +38,12 @@ func NewCgroupManager(runcRoot, namespace string) CgroupManager {
 
 func (m cgroupManager) SetUseMemoryHierarchy(handle string) error {
 	statePath := filepath.Join(m.runcRoot, m.namespace, handle, "state.json")
+	// Patch5-skip-when-no-state: non-runc runtimes (e.g. runsc) do not write
+	// state.json to the runc root; on cgroup v2 the memory.use_hierarchy knob
+	// does not exist either. Treat as no-op when state.json is absent.
+	if _, statErr := os.Stat(statePath); os.IsNotExist(statErr) {
+		return nil
+	}
 	stateFile, err := os.Open(statePath)
 	if err != nil {
 		return err

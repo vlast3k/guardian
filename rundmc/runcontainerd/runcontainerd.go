@@ -175,12 +175,21 @@ func (r *RunContainerd) Exec(log lager.Logger, containerID string, gardenProcess
 		return nil, err
 	}
 
-	resolvedUser, err := r.userLookupper.Lookup(fmt.Sprintf("/proc/%d/root", containerPid), gardenProcessSpec.User)
+	procRoot := fmt.Sprintf("/proc/%d/root", containerPid)
+	// Patch4-bundle-root-fallback: for runsc, /proc/<sandbox>/root is the host fs;
+	// fall back to the bundle's rootfs path so user-lookup and mkdir work.
+	lookupRoot := procRoot
+	if _, statErr := os.Stat(filepath.Join(procRoot, "etc", "passwd")); statErr != nil {
+		if bundle.Spec.Root != nil && bundle.Spec.Root.Path != "" {
+			lookupRoot = bundle.Spec.Root.Path
+		}
+	}
+	resolvedUser, err := r.userLookupper.Lookup(lookupRoot, gardenProcessSpec.User)
 	if err != nil {
 		return nil, err
 	}
 
-	rootfsPath := filepath.Join("/proc", strconv.FormatInt(int64(containerPid), 10), "root")
+	rootfsPath := lookupRoot
 
 	hostUID := idmapper.MappingList(bundle.Spec.Linux.UIDMappings).Map(resolvedUser.Uid)
 	hostGID := idmapper.MappingList(bundle.Spec.Linux.GIDMappings).Map(resolvedUser.Gid)

@@ -191,6 +191,8 @@ type CommonCommand struct {
 	Containerd struct {
 		Socket                    string `long:"containerd-socket" description:"Path to a containerd socket."`
 		UseContainerdForProcesses bool   `long:"use-containerd-for-processes" description:"Use containerd to run processes in containers."`
+		// Patch1-runtime-type: lets us announce a non-runc runtime (e.g. io.containerd.runsc.v1) to containerd
+		RuntimeType               string `long:"containerd-runtime-type" description:"Containerd runtime type (e.g. io.containerd.runc.v2 or io.containerd.runsc.v1)."`
 	} `group:"Containerd"`
 
 	CPUThrottling struct {
@@ -692,7 +694,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		return nil, nil, err
 	}
 
-	return rundmc.New(depot, template, ociRuntime, nstar, processesStopper, eventStore, stateStore, peaCreator, peaUsernameResolver, cpuEntitlementPerShare, runtimeStopper, cpuCgrouper), peaCleaner, nil
+	return rundmc.New(depot, template, ociRuntime, nstar, processesStopper, eventStore, stateStore, peaCreator, peaUsernameResolver, cpuEntitlementPerShare, runtimeStopper, cpuCgrouper, cmd.Containerd.RuntimeType), peaCleaner, nil
 }
 
 func (cmd *CommonCommand) useContainerd() bool {

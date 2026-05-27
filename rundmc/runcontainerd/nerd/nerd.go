@@ -21,30 +21,55 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	ctrdevents "github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// Patch1-runtime-type: track the configured containerd runtime so Create can
+// adapt for non-runc shims (which reject runc-specific options/spec fields).
 type Nerd struct {
-	client    *client.Client
-	context   context.Context
-	ioFifoDir string
-	mp        *metrics.MetricsProvider
+	client      *client.Client
+	context     context.Context
+	ioFifoDir   string
+	mp          *metrics.MetricsProvider
+	runtimeType string
 }
 
-func New(client *client.Client, context context.Context, ioFifoDir string, mp *metrics.MetricsProvider) *Nerd {
+func New(client *client.Client, context context.Context, ioFifoDir string, mp *metrics.MetricsProvider, runtimeType string) *Nerd {
 	return &Nerd{
-		client:    client,
-		context:   context,
-		ioFifoDir: ioFifoDir,
-		mp:        mp,
+		client:      client,
+		context:     context,
+		ioFifoDir:   ioFifoDir,
+		mp:          mp,
+		runtimeType: runtimeType,
 	}
 }
 
 func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, hostUID, hostGID uint32, pio func() (io.Reader, io.Writer, io.Writer)) error {
 	log.Debug("creating-container", lager.Data{"containerID": containerID})
+	// Patch3: non-runc shims (e.g. runsc) reject spec.Windows fields that Garden's
+	// pre-init bundle template carries. Strip them before NewContainer for those.
+	if n.runtimeType != "" && n.runtimeType != plugins.RuntimeRuncV2 {
+		spec.Windows = nil
+		// Patch10-strip-userns: gVisor's gofer cannot setns into the sandbox's user
+		// namespace (lacks CAP_SYS_ADMIN there). Drop user NS + uid/gid mappings;
+		// the sandbox itself provides the security boundary.
+		if spec.Linux != nil {
+			filtered := spec.Linux.Namespaces[:0]
+			for _, ns := range spec.Linux.Namespaces {
+				if ns.Type == "user" {
+					continue
+				}
+				filtered = append(filtered, ns)
+			}
+			spec.Linux.Namespaces = filtered
+			spec.Linux.UIDMappings = nil
+			spec.Linux.GIDMappings = nil
+		}
+	}
 	container, err := n.client.NewContainer(n.context, containerID, client.WithSpec(spec))
 	if err != nil {
 		return err
@@ -58,7 +83,13 @@ func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, ho
 	}
 
 	log.Debug("creating-task", lager.Data{"containerID": containerID})
-	task, err := container.NewTask(n.context, cio.NewCreator(withProcessIO(noTTYProcessIO(pio), n.ioFifoDir)), client.WithNoNewKeyring, WithUIDAndGID(hostUID, hostGID))
+	// Patch2: WithNoNewKeyring and WithUIDAndGID set runc-specific options that
+	// non-runc shims reject. For runsc, omit them.
+	var taskOpts []client.NewTaskOpts
+	if n.runtimeType == "" || n.runtimeType == plugins.RuntimeRuncV2 {
+		taskOpts = append(taskOpts, client.WithNoNewKeyring, WithUIDAndGID(hostUID, hostGID))
+	}
+	task, err := container.NewTask(n.context, cio.NewCreator(withProcessIO(noTTYProcessIO(pio), n.ioFifoDir)), taskOpts...)
 	if err != nil {
 		return err
 	}
