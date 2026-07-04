@@ -9,13 +9,16 @@ import (
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/guardian/gardener"
 	"code.cloudfoundry.org/lager/v3"
+	cgroup1stats "github.com/containerd/cgroups/v3/cgroup1/stats"
 	cgroup2stats "github.com/containerd/cgroups/v3/cgroup2/stats"
 	"github.com/containerd/typeurl/v2"
 )
 
 // ContainerMetricsGetter abstracts the containerd task metrics retrieval.
+// Returns the raw protobuf Any from task.Metrics() so the caller can handle
+// both cgroupv1 and cgroupv2 formats.
 type ContainerMetricsGetter interface {
-	TaskMetrics(log lager.Logger, containerID string) (*cgroup2stats.Metrics, time.Time, error)
+	TaskMetrics(log lager.Logger, containerID string) (typeurl.Any, time.Time, error)
 }
 
 // ContainerdStatser implements the Statser interface using containerd task
@@ -33,50 +36,70 @@ func NewContainerdStatser(metricsGetter ContainerMetricsGetter) *ContainerdStats
 func (s *ContainerdStatser) Stats(log lager.Logger, id string) (gardener.StatsContainerMetrics, error) {
 	log = log.Session("containerd-statser", lager.Data{"id": id})
 
-	metrics, createdAt, err := s.metricsGetter.TaskMetrics(log, id)
+	rawMetrics, createdAt, err := s.metricsGetter.TaskMetrics(log, id)
 	if err != nil {
 		return gardener.StatsContainerMetrics{}, fmt.Errorf("containerd task metrics: %w", err)
 	}
 
+	// Try cgroupsv2 first, then fall back to cgroupsv1.
+	// runsc shim typically returns v1 format even on cgroupsv2 hosts.
+	if metrics, err := unmarshalV2Metrics(rawMetrics); err == nil {
+		return statsFromV2(metrics, createdAt), nil
+	}
+	if metrics, err := unmarshalV1Metrics(rawMetrics); err == nil {
+		return statsFromV1(metrics, createdAt), nil
+	}
+
+	return gardener.StatsContainerMetrics{}, fmt.Errorf("containerd task metrics: unsupported metrics type")
+}
+
+func unmarshalV2Metrics(data typeurl.Any) (*cgroup2stats.Metrics, error) {
+	var m cgroup2stats.Metrics
+	if err := typeurl.UnmarshalTo(data, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func unmarshalV1Metrics(data typeurl.Any) (*cgroup1stats.Metrics, error) {
+	var m cgroup1stats.Metrics
+	if err := typeurl.UnmarshalTo(data, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func statsFromV2(metrics *cgroup2stats.Metrics, createdAt time.Time) gardener.StatsContainerMetrics {
 	var memoryStat garden.ContainerMemoryStat
 	if metrics.Memory != nil {
 		memoryStat = garden.ContainerMemoryStat{
-			Anon:         metrics.Memory.Anon,
-			File:         metrics.Memory.File,
-			ActiveAnon:   metrics.Memory.ActiveAnon,
-			InactiveAnon: metrics.Memory.InactiveAnon,
-			ActiveFile:   metrics.Memory.ActiveFile,
-			InactiveFile: metrics.Memory.InactiveFile,
-			Unevictable:  metrics.Memory.Unevictable,
-			MappedFile:   metrics.Memory.FileMapped,
-			Pgfault:      metrics.Memory.Pgfault,
-			Pgmajfault:   metrics.Memory.Pgmajfault,
-			SwapCached:   0, // cgroupsv2 does not expose swapcached separately
-			// cgroupsv2 does not have hierarchical_memory_limit;
-			// usage_limit is the closest equivalent
+			Anon:                    metrics.Memory.Anon,
+			File:                    metrics.Memory.File,
+			ActiveAnon:              metrics.Memory.ActiveAnon,
+			InactiveAnon:            metrics.Memory.InactiveAnon,
+			ActiveFile:              metrics.Memory.ActiveFile,
+			InactiveFile:            metrics.Memory.InactiveFile,
+			Unevictable:             metrics.Memory.Unevictable,
+			MappedFile:              metrics.Memory.FileMapped,
+			Pgfault:                 metrics.Memory.Pgfault,
+			Pgmajfault:              metrics.Memory.Pgmajfault,
+			SwapCached:              0, // cgroupsv2 does not expose swapcached separately
 			HierarchicalMemoryLimit: metrics.Memory.UsageLimit,
-			// Populate TotalXxx with the same values (cgroupsv2 unified hierarchy
-			// means there is no separate "total" vs "local" distinction)
-			TotalActiveAnon:   metrics.Memory.ActiveAnon,
-			TotalActiveFile:   metrics.Memory.ActiveFile,
-			TotalInactiveAnon: metrics.Memory.InactiveAnon,
-			TotalInactiveFile: metrics.Memory.InactiveFile,
-			TotalUnevictable:  metrics.Memory.Unevictable,
-			TotalMappedFile:   metrics.Memory.FileMapped,
-			TotalPgfault:      metrics.Memory.Pgfault,
-			TotalPgmajfault:   metrics.Memory.Pgmajfault,
-			// For cgroupsv2, "Rss" is essentially Anon + swap-backed anon
-			Rss:      metrics.Memory.Anon,
-			TotalRss: metrics.Memory.Anon,
-			// Cache = file-backed pages
-			Cache:      metrics.Memory.File,
-			TotalCache: metrics.Memory.File,
-			// Swap
-			Swap:      metrics.Memory.SwapUsage,
-			TotalSwap: metrics.Memory.SwapUsage,
+			TotalActiveAnon:         metrics.Memory.ActiveAnon,
+			TotalActiveFile:         metrics.Memory.ActiveFile,
+			TotalInactiveAnon:       metrics.Memory.InactiveAnon,
+			TotalInactiveFile:       metrics.Memory.InactiveFile,
+			TotalUnevictable:        metrics.Memory.Unevictable,
+			TotalMappedFile:         metrics.Memory.FileMapped,
+			TotalPgfault:            metrics.Memory.Pgfault,
+			TotalPgmajfault:         metrics.Memory.Pgmajfault,
+			Rss:                     metrics.Memory.Anon,
+			TotalRss:                metrics.Memory.Anon,
+			Cache:                   metrics.Memory.File,
+			TotalCache:              metrics.Memory.File,
+			Swap:                    metrics.Memory.SwapUsage,
+			TotalSwap:               metrics.Memory.SwapUsage,
 		}
-		// Calculate TotalUsageTowardLimit the same way garden does for cgroupsv2:
-		// File + Anon + SwapCached - InactiveFile
 		totalMemoryUsage := memoryStat.File + memoryStat.Anon + memoryStat.SwapCached
 		if memoryStat.InactiveFile > totalMemoryUsage {
 			memoryStat.TotalUsageTowardLimit = 0
@@ -108,15 +131,70 @@ func (s *ContainerdStatser) Stats(log lager.Logger, id string) (gardener.StatsCo
 		Memory: memoryStat,
 		Pid:    pidStat,
 		Age:    time.Since(createdAt),
-	}, nil
+	}
 }
 
-// UnmarshalContainerdMetrics unmarshals the protobuf Any from containerd task
-// metrics response into cgroupsv2 Metrics.
-func UnmarshalContainerdMetrics(data typeurl.Any) (*cgroup2stats.Metrics, error) {
-	var m cgroup2stats.Metrics
-	if err := typeurl.UnmarshalTo(data, &m); err != nil {
-		return nil, fmt.Errorf("unmarshal cgroupsv2 metrics: %w", err)
+func statsFromV1(metrics *cgroup1stats.Metrics, createdAt time.Time) gardener.StatsContainerMetrics {
+	var memoryStat garden.ContainerMemoryStat
+	if metrics.Memory != nil {
+		m := metrics.Memory
+		memoryStat = garden.ContainerMemoryStat{
+			Cache:                   m.Cache,
+			Rss:                     m.RSS,
+			MappedFile:              m.MappedFile,
+			Pgfault:                 m.PgFault,
+			Pgmajfault:              m.PgMajFault,
+			ActiveAnon:              m.ActiveAnon,
+			InactiveAnon:            m.InactiveAnon,
+			ActiveFile:              m.ActiveFile,
+			InactiveFile:            m.InactiveFile,
+			Unevictable:             m.Unevictable,
+			HierarchicalMemoryLimit: m.HierarchicalMemoryLimit,
+			TotalCache:              m.TotalCache,
+			TotalRss:                m.TotalRSS,
+			TotalMappedFile:         m.TotalMappedFile,
+			TotalPgfault:            m.TotalPgFault,
+			TotalPgmajfault:         m.TotalPgMajFault,
+			TotalActiveAnon:         m.TotalActiveAnon,
+			TotalInactiveAnon:       m.TotalInactiveAnon,
+			TotalActiveFile:         m.TotalActiveFile,
+			TotalInactiveFile:       m.TotalInactiveFile,
+			TotalUnevictable:        m.TotalUnevictable,
+			// Anon and File not in v1 directly; approximate from totals
+			Anon: m.TotalRSS,
+			File: m.TotalCache,
+		}
+		if m.Swap != nil {
+			memoryStat.Swap = m.Swap.Usage
+			memoryStat.TotalSwap = m.Swap.Usage
+		}
+		if m.Usage != nil {
+			memoryStat.TotalUsageTowardLimit = m.Usage.Usage
+		}
 	}
-	return &m, nil
+
+	var cpuStat garden.ContainerCPUStat
+	if metrics.CPU != nil && metrics.CPU.Usage != nil {
+		// cgroupsv1 CPU is already in nanoseconds
+		cpuStat = garden.ContainerCPUStat{
+			Usage:  metrics.CPU.Usage.Total,
+			User:   metrics.CPU.Usage.User,
+			System: metrics.CPU.Usage.Kernel,
+		}
+	}
+
+	var pidStat garden.ContainerPidStat
+	if metrics.Pids != nil {
+		pidStat = garden.ContainerPidStat{
+			Current: metrics.Pids.Current,
+			Max:     metrics.Pids.Limit,
+		}
+	}
+
+	return gardener.StatsContainerMetrics{
+		CPU:    cpuStat,
+		Memory: memoryStat,
+		Pid:    pidStat,
+		Age:    time.Since(createdAt),
+	}
 }
