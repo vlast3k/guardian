@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -136,8 +137,67 @@ func (n *Nerd) Delete(log lager.Logger, containerID string) error {
 	}
 
 	log.Debug("deleting-task", lager.Data{"containerID": containerID})
+	status, err := task.Status(n.context)
+	if err != nil {
+		return err
+	}
+	if status.Status == client.Created && task.Pid() != 0 && n.runtimeType != "" && n.runtimeType != plugins.RuntimeRuncV2 {
+		shimPID, err := parentShimPID(task.Pid(), os.ReadFile)
+		if err != nil {
+			return err
+		}
+		if err := syscall.Kill(shimPID, syscall.SIGKILL); err != nil {
+			return err
+		}
+
+		deadline := time.After(time.Minute * 2)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, err := task.Status(n.context)
+				if errdefs.IsNotFound(err) {
+					n.mp.RegisterKillableContainer(task.ID())
+					return nil
+				}
+			case <-deadline:
+				n.mp.RegisterUnkillableContainer(task.ID())
+				return fmt.Errorf("container still exists 2 minutes after killing its runtime shim: containerdProcess=%s, processID=%d", task.ID(), task.Pid())
+			}
+		}
+	}
 	_, err = task.Delete(n.context, withProcessKillLogging(log, n.mp))
 	return err
+}
+
+func parentShimPID(taskPID uint32, readFile func(string) ([]byte, error)) (int, error) {
+	status, err := readFile(fmt.Sprintf("/proc/%d/status", taskPID))
+	if err != nil {
+		return 0, err
+	}
+
+	for _, line := range strings.Split(string(status), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "PPid:" {
+			continue
+		}
+
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return 0, err
+		}
+		comm, err := readFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			return 0, err
+		}
+		if !strings.HasPrefix(strings.TrimSpace(string(comm)), "containerd-shim") {
+			return 0, fmt.Errorf("task parent process %d is not a containerd shim", pid)
+		}
+		return pid, nil
+	}
+
+	return 0, fmt.Errorf("parent process not found for task PID %d", taskPID)
 }
 
 func (n *Nerd) State(log lager.Logger, containerID string) (int, string, error) {
