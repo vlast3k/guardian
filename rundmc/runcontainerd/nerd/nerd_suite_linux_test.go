@@ -39,6 +39,7 @@ var (
 	cgroupsPath string
 
 	testConfig        *TestConfig
+	testRuntimeType   string
 	containerdClient  *client.Client
 	containerdContext context.Context
 	containerdProcess *os.Process
@@ -79,7 +80,12 @@ var _ = BeforeEach(func() {
 	containerdConfig := containerdrunner.ContainerdConfig(runDir)
 	containerdProcess = containerdrunner.NewContainerdProcess(runDir, containerdConfig)
 
-	containerdClient, err = client.New(containerdConfig.GRPC.Address, client.WithDefaultRuntime(plugins.RuntimeRuncV2))
+	testRuntimeType = os.Getenv("NERD_TEST_RUNTIME_TYPE")
+	if testRuntimeType == "" {
+		testRuntimeType = plugins.RuntimeRuncV2
+	}
+
+	containerdClient, err = client.New(containerdConfig.GRPC.Address, client.WithDefaultRuntime(testRuntimeType))
 	Expect(err).NotTo(HaveOccurred())
 
 	containerdContext = namespaces.WithNamespace(context.Background(), fmt.Sprintf("nerdspace%d", GinkgoParallelProcess()))

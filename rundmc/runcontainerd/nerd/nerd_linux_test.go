@@ -18,10 +18,12 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/plugins"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
 	"github.com/onsi/gomega/gexec"
+	cgrouputils "github.com/opencontainers/cgroups"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"code.cloudfoundry.org/guardian/metrics"
@@ -46,6 +48,7 @@ var _ = Describe("Nerd", func() {
 		stderr        io.Writer
 		spec          *specs.Spec
 		mp            *metrics.MetricsProvider
+		rootfsMounted bool
 	)
 
 	const (
@@ -76,12 +79,15 @@ var _ = Describe("Nerd", func() {
 	})
 
 	JustBeforeEach(func() {
-		cnerd = nerd.New(containerdClient, containerdContext, fifoDir, mp, "")
+		cnerd = nerd.New(containerdClient, containerdContext, fifoDir, mp, testRuntimeType)
 	})
 
 	AfterEach(func() {
 		Expect(os.RemoveAll(fifoDir)).To(Succeed())
 		if spec != nil && spec.Root != nil {
+			if rootfsMounted {
+				Expect(syscall.Unmount(spec.Root.Path, syscall.MNT_DETACH)).To(Succeed())
+			}
 			Expect(os.RemoveAll(filepath.Dir(spec.Root.Path))).To(Succeed())
 		}
 	})
@@ -436,6 +442,10 @@ var _ = Describe("Nerd", func() {
 	Describe("Delete", func() {
 		JustBeforeEach(func() {
 			spec = generateSpec(containerdContext, containerdClient, containerID)
+			if testRuntimeType != plugins.RuntimeRuncV2 {
+				Expect(syscall.Mount(spec.Root.Path, spec.Root.Path, "", syscall.MS_BIND|syscall.MS_REC, "")).To(Succeed())
+				rootfsMounted = true
+			}
 			Expect(cnerd.Create(testLogger, containerID, spec, maximusUID, maximusGID, initProcessIO)).To(Succeed())
 		})
 
@@ -444,6 +454,27 @@ var _ = Describe("Nerd", func() {
 
 			tasks := listTasks(testConfig.CtrBin, testConfig.Socket)
 			Expect(tasks).NotTo(ContainSubstring(containerID))
+		})
+
+		It("deletes a created alternative-runtime task using the required shim cleanup", func() {
+			if testRuntimeType == plugins.RuntimeRuncV2 {
+				Skip("requires an alternative Runtime v2 shim")
+			}
+
+			pid, status, err := cnerd.State(testLogger, containerID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pid).NotTo(BeZero())
+			Expect(status).To(Equal(string(client.Created)))
+
+			Expect(cnerd.Delete(testLogger, containerID)).To(Succeed())
+
+			tasks := listTasks(testConfig.CtrBin, testConfig.Socket)
+			Expect(tasks).NotTo(ContainSubstring(containerID))
+
+			if cgrouputils.IsCgroup2UnifiedMode() {
+				err := os.Remove(filepath.Join("/sys/fs/cgroup", fmt.Sprintf("nerdspace%d", GinkgoParallelProcess()), containerID))
+				Expect(err == nil || os.IsNotExist(err)).To(BeTrue())
+			}
 		})
 	})
 
